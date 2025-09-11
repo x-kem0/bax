@@ -1,0 +1,426 @@
+#!/usr/bin/python
+# bax
+# borg wrapper with a focus on multiple identical repos
+# primary use case is synchronizing both an encrypted web backup and 
+# an unencrypted backup on a USB-connected SSD
+#
+# the database is not encrypted because I figure that if they have access to this database, they also
+# have access to the things you are backing up in the first place, so who cares
+
+import sqlite3
+import argparse
+import os
+import subprocess
+import errno
+import secrets
+import time
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# static vars
+VERSION = "0.0.0"
+CONFIG_PATH = Path.home() / ".local/share/bax"
+CONFIG_PATH.mkdir(parents=True, exist_ok=True)
+DB_PATH = CONFIG_PATH / "bax.db"
+PASSPHRASE_LENGTH = 64
+
+SPINNER_CHARS = ['⣾','⣽','⣻','⢿','⡿','⣟','⣯','⣷']
+spinner_idx = {}
+
+# "logging" functions
+def info(msg):
+    print(f"\033[96m[INFO]\033[0m {msg}")
+
+def error(msg):
+    print(f"\033[31m[ERROR]\033[0m {msg}")
+
+def warning(msg):
+    print(f"\033[93m[WARNING]\033[0m {msg}")
+
+def spinner(id):
+    if id not in spinner_idx:
+        spinner_idx[id] = 0
+    idx = spinner_idx[id]
+
+    next = idx + 1
+    if(next > len(SPINNER_CHARS) - 1):
+        spinner_idx[id] = 0
+    else:
+        spinner_idx[id] = next
+
+    return SPINNER_CHARS[idx]
+
+
+# initialize database
+if not DB_PATH.exists():
+    info("database does not exist, creating now...")
+    db = sqlite3.connect(DB_PATH)
+    cur = db.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS files (
+            filepath TEXT NOT NULL,
+            type TEXT NOT NULL
+        )
+        """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS repos (
+            name TEXT PRIMARY KEY NOT NULL,
+            encrypted BOOLEAN NOT NULL,
+            path TEXT NOT NULL,
+            passphrase TEXT
+        )
+        """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS info (
+            key TEXT PRIMARY KEY NOT NULL,
+            value TEXT NOT NULL
+        )
+        """)
+    cur.execute("INSERT INTO info (key, value) VALUES ('version', ?)", [VERSION])
+    cur.execute("INSERT INTO info (key, value) VALUES ('what_is_this', 'this is a bax backup database')")
+    db.commit()
+    db.close()
+    warning(f"it is recommended to run 'bax add {CONFIG_PATH}'")
+
+db = sqlite3.connect(DB_PATH)
+
+parser = argparse.ArgumentParser(prog='bax',
+                                 description='borg backup manager')
+# core functionality
+
+def repo_exists(name, filepath):
+    cur = db.cursor()
+    cur.execute("SELECT name FROM repos WHERE name = ? OR path = ?", [name, filepath])
+    return len(cur.fetchall()) > 0
+
+def borg_init_unencrypted(name, filepath):
+    path = filepath if filepath.startswith("ssh://") else Path(filepath).resolve()
+
+    # check if repo already exists
+    if repo_exists(name, filepath):
+        error("a repo with this name or filepath already exists; run 'bax repo list'")
+        exit(1)
+
+    # set environment variables and run borg
+    environ = os.environ.copy()
+    environ["BORG_REPO"] = filepath
+    result = subprocess.run(["borg", "init", "--encryption=none"], env=environ, capture_output=True)
+    if result.returncode != 0:
+        error(f"failed to init borg repo:\n{result.stderr.decode("utf-8")}")
+        exit(1)
+
+    # insert into database
+    cur = db.cursor()
+    cur.execute("INSERT INTO repos (name, path, encrypted) VALUES (?, ?, false)", [name, str(path)])
+    db.commit()
+
+    info(f"created unencrypted repo '{name}' at path: {path}")
+
+def borg_init_repokey(name, filepath):
+    path = filepath if filepath.startswith("ssh://") else Path(filepath).resolve()
+
+    # check if repo already exists
+    if repo_exists(name, filepath):
+        error("a repo with this name or filepath already exists; run 'bax repo list'")
+        exit(1)
+
+    # set environment variables and run borg
+    passphrase = secrets.token_hex(PASSPHRASE_LENGTH)
+    environ = os.environ.copy()
+    environ["BORG_REPO"] = filepath
+    environ["BORG_NEW_PASSPHRASE"] = passphrase
+    result = subprocess.run(["borg", "init", "--encryption=repokey"], env=environ, capture_output=True)
+    if result.returncode != 0:
+        error(f"failed to init borg repo:\n{result.stderr.decode("utf-8")}")
+        exit(1)
+
+    # insert into database
+    cur = db.cursor()
+    cur.execute("INSERT INTO repos (name, path, passphrase, encrypted) VALUES (?, ?, ?, true)", [name, str(path), passphrase])
+    db.commit()
+
+    info(f"created repokey repo '{name}' at path: {path}")
+
+def is_file_tracked(filepath):
+    cur = db.cursor()
+    cur.execute("SELECT type FROM files WHERE filepath = ?", [str(filepath)])
+    return len(cur.fetchall()) > 0
+
+def add_file(filepath):
+    if filepath == "":
+        error("no filename provided")
+        exit(1)
+
+    # resolve symlink and use absolute path
+    path = Path(filepath)
+    if not path.is_absolute():
+        path = Path(os.getcwd()) / filepath
+
+    path = path.resolve()
+
+    if '\n' in str(path):
+        error("newlines in filepaths are not supported by bax")
+        exit(1)
+
+    # check that file exists
+    try:
+        if not path.exists():
+            error(f"file not found: {path}")
+            exit(1)
+    except IOError as e:
+        if e.errno == errno.EACCES:
+            error(f"failed to read file; permissions issue")
+        else:
+            error(f"failed to read file; unknown errno #{e.errno}")
+        exit(1)
+
+    # even if file exists, check that we have read access to it (e.g., /root)
+    if not os.access(path, os.R_OK):
+        error(f"failed to read file; possible permissions issue")
+        exit(1)
+
+    # check that we aren't adding something stupid like /dev/random
+    type = None
+    if path.is_file():
+        type = "file"
+    elif path.is_dir():
+        type = "dir"
+    else:
+        error("unsupported file type (device, etc.)")
+        exit(1)
+
+    if is_file_tracked(path):
+        warning("file is already tracked, ignoring...")
+        exit(0)
+    
+    cur = db.cursor()
+    cur.execute("INSERT INTO files (filepath, type) VALUES (?, ?)", [str(path), type])
+    db.commit()
+    print(f"added {type}:\n{path.resolve()}")
+
+def get_all_with_types():
+    cur = db.cursor()
+    cur.execute("SELECT type, filepath FROM files")
+    return cur.fetchall()
+
+def get_all():
+    cur = db.cursor()
+    cur.execute("SELECT filepath FROM files")
+    return [file[0] for file in cur.fetchall()]
+
+def get_dirs():
+    cur = db.cursor()
+    cur.execute("SELECT filepath FROM files WHERE type = 'dir'")
+    return [file[0] for file in cur.fetchall()]
+
+# cli commands
+
+def command_help(_args):
+    print(f"bax {VERSION}")
+    parser.print_help()
+
+def command_add(args):
+    add_file(args.filepath)
+
+def command_remove(args):
+    print("REM")
+
+def command_list(_args):
+    files = get_all_with_types()
+    if len(files) > 0:
+        for t, file in files:
+            color_code = "\033[36m" if t == "dir" else "\033[32m"
+            print(f"{color_code}[{t}]\033[0m {file}")
+    else:
+        print("no files or directories tracked")
+
+def command_status(_args):
+    print("STATUS")
+
+# bax go
+def command_go(_args):
+    # get repos
+    cur = db.cursor()
+    cur.execute("SELECT name, path, encrypted, passphrase FROM repos")
+    repos = cur.fetchall()
+    if len(repos) == 0:
+        error("no repos configured with bax")
+        exit(1)
+
+    archive_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    info(f"starting backup {archive_name}")
+
+    # get all files and directories
+    files = get_all()
+    if len(files) == 0:
+        error("no files or directories tracked; backup aborted")
+        exit(1)
+
+    # borg_files = "\n".join(files)
+
+    # start borg processes
+    borg_processes = []
+    for _name, path, encrypted, passphrase in repos:
+        # set up environment variables
+        environ = os.environ.copy()
+        environ["BORG_PASSPHRASE"] = passphrase or ""
+
+        # run process
+        proc = subprocess.Popen(
+            ["borg", "create", f"{path}::{archive_name}"] + files, 
+            env = environ,
+            stdin=subprocess.PIPE, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE
+        )
+        # proc.communicate(input=borg_files.encode('utf-8'))
+        borg_processes.append(proc)
+
+
+        # failure test code
+        # if secrets.randbelow(3) == 0:
+        #     proc = subprocess.Popen(["sleep", str(secrets.randbelow(10))], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        #     borg_processes.append(proc)
+        # else:
+        #     proc = subprocess.Popen(["ls", "--not-real"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        #     borg_processes.append(proc)
+
+    # save cursor position, hide cursor
+    sys.stdout.write(
+        f"{"\n"*len(repos)}"
+        "\033?25l"  # hide cursor
+        "\r"
+        "\0337"     # save cursor pos
+    )
+    sys.stdout.flush()
+
+    while True:
+        # restore cursor position and clear previous text
+        sys.stdout.write(
+            "\0338"
+            "\033[3J"
+            "\033[2K"   
+            "\033[1B"
+            "\033[2K"
+            f"\033[{len(repos)}A"
+            "\033[?25l"
+        )
+
+        backup_finished = True
+        for i, (name, path, _encrypted, passphrase) in enumerate(repos):
+            proc = borg_processes[i]
+            running = proc.poll() is None
+            if running:
+                backup_finished = False
+                sys.stdout.write(f"{spinner(name)} {name}\n")
+            else:
+                if proc.returncode == 0:
+                    sys.stdout.write(f"✔ {name}\n")
+                else:
+                    sys.stdout.write(f"× {name}\n")
+
+        sys.stdout.flush()
+
+        if backup_finished:
+            break
+        time.sleep(0.1)
+    # show cursor
+    print('\033[?25h')
+
+    exitcode = 0
+    for i, proc in enumerate(borg_processes):
+        if proc.returncode != 0:
+            error(f"repo {repos[i][0]} failed: {proc.communicate()[1].decode()}")
+            exitcode = 1
+    if exitcode == 0:
+        info("backup complete")
+    else:
+        error("backup complete with errors")
+    exit(exitcode)
+
+def command_repo_list(args):
+    cur = db.cursor()
+    cur.execute("SELECT name, path, encrypted FROM repos")
+    entries = cur.fetchall()
+    if len(entries) == 0:
+        print("no repos added")
+        return
+
+    for entry in entries:
+        name, path, encrypted = entry
+        prefix = "ENCRYPTED" if encrypted else "UNENCRYPT"
+        print(f"[{prefix}] {name} - {path}")
+
+def command_repo_remove(args):
+    print("ARCHIVE REMOVE")
+
+def command_repo_init_unencrypted(args):
+    borg_init_unencrypted(args.name, args.path)
+
+def command_repo_init_repokey(args):
+    borg_init_repokey(args.name, args.path)
+
+if __name__=="__main__":
+    # configure command parsers
+    parser.set_defaults(func=command_help)
+    subparsers = parser.add_subparsers()
+
+    # bax add <filepath>
+    p_add = subparsers.add_parser('add', help='add files to backup')
+    p_add.add_argument('filepath', type=str, help='filepath to add to backup')
+    p_add.set_defaults(func=command_add)
+
+    # bax remove <filepath>
+    p_remove = subparsers.add_parser('remove', help='remove files from backup')
+    p_remove.add_argument('filepath', type=str, help='filepath to remove to backup')
+    p_remove.set_defaults(func=command_remove)
+
+    # bax list
+    p_list = subparsers.add_parser('list', help='list files marked for backup')
+    p_list.set_defaults(func=command_list)
+
+    # p_status = subparsers.add_parser('status', help='backup status')
+    # p_status.set_defaults(func=command_status)
+
+    # bax go
+    p_now = subparsers.add_parser('go', help='perform system backup')
+    p_now.set_defaults(func=command_go)
+
+    # bax repo
+    p_repo = subparsers.add_parser('repo', help='edit repos')
+    p_repo.set_defaults(func=lambda _args: p_repo.print_help())
+    p_repo_sp = p_repo.add_subparsers()
+
+    # bax repo init
+    p_repo_init = p_repo_sp.add_parser('init', help='initialize new repo')
+    p_repo_init.set_defaults(func=lambda _args: p_repo_init.print_help())
+
+    p_repo_init_sp = p_repo_init.add_subparsers()
+    
+    # bax repo init repokey
+    p_repo_init_repokey = p_repo_init_sp.add_parser('repokey', help='initialize new repo with repokey encryption')
+    p_repo_init_repokey.add_argument('name', type=str, help='repo name')
+    p_repo_init_repokey.add_argument('path', type=str, help='repo path (see borg docs)')
+    p_repo_init_repokey.set_defaults(func=command_repo_init_repokey)
+
+    # bax repo init unencrypted
+    p_repo_init_unencrypted = p_repo_init_sp.add_parser('unencrypted', help='initialize new repo with no encryption')
+    p_repo_init_unencrypted.add_argument('name', type=str, help='repo name')
+    p_repo_init_unencrypted.add_argument('path', type=str, help='repo path (see borg docs)')
+    p_repo_init_unencrypted.set_defaults(func=command_repo_init_unencrypted)
+    
+    # bax repo list
+    p_repo_list = p_repo_sp.add_parser('list', help='list all repos')
+    p_repo_list.set_defaults(func=command_repo_list)
+
+    # bax repo remove
+    p_repo_remove = p_repo_sp.add_parser('remove', help='remove repo')
+    p_repo_remove.set_defaults(func=command_repo_remove)
+
+    args = parser.parse_args()
+
+    # run 'default' func for the given command
+    args.func(args)
+
+    db.close()
