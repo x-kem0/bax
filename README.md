@@ -5,6 +5,9 @@ terminal backup tool with a borg backend
 
 Install borg through your package manager
 
+Place `bax` into a place of your choosing and add it to your shell paths
+It is recommended to use `$HOME/.local/bin`
+
 Intiialize a borg repo with bax:
 ```
 bax repo init <repokey/unencrypted> <name> <location>
