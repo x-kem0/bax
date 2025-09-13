@@ -60,11 +60,6 @@ bax repo init repokey <name> <location>
 Initialize a repokey borg repository with the given name and location
 
 ```
-bax repo init repokey <name> <location>
-```
-Initialize a repokey borg repository with the given name and location
-
-```
 bax repo init unencrypted <name> <location>
 ```
 Initialize an unencrypted borg repository with the given name and location
